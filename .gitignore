@@ -1,0 +1,18 @@
+# 敏感信息
+.env
+*.key
+*.pem
+*_secret*
+credentials*
+token*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 临时文件
+*.tmp
+*.log
+.DS_Store
