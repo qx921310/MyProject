@@ -21,5 +21,6 @@ CodeHub/
 ## 使用约定
 
 - 新脚本先在此仓库开发测试，验证通过后部署到 `~/.hermes/scripts/` 供 cron 调用
+- **质量门槛（强制）**：所有代码提交前必须经过代码审查（code review）——由 Codex 审查（或 Hermes 调用 requesting-code-review 技能），审查通过才能 commit，不可省略
 - 每次修改记得 commit，保持仓库可追溯
 - 敏感信息（API key 等）绝不入库，一律放 `~/.hermes/.env`
