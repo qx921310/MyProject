@@ -121,7 +121,7 @@ def check_restart_stuck():
         return (
             '❌ Gateway 疑似卡在重啟等待：最後一次 "Restart deferred" 距今超過 '
             f'{RESTART_STUCK_MINUTES} 分鐘且無完成標記，建議執行 '
-            'systemctl --user restart hermes-gateway'
+            '請讓雲管家強制重啟 hermes-gateway 服務'
         )
     return None
 
