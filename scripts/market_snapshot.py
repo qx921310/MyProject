@@ -2,7 +2,7 @@
 """Market snapshot: A-share indices, spot gold (伦敦金), and US indices.
 
 Sources:
-  - A-share indices: Tencent quote API (GBK encoded)
+  - A-share indices: AKShare Sina source (主用), Tencent quote API (备用)
   - Spot gold: TradingView scanner API
   - US indices: Yahoo Finance chart API
 """
@@ -55,8 +55,44 @@ def format_tencent_ts(raw):
     return raw
 
 
-def fetch_ashare():
-    """Fetch 上证指数 / 创业板指 / 科创50 from the Tencent quote API."""
+def fetch_ashare_sina():
+    """Fetch 上证指数 / 创业板指 / 科创50 from the AKShare Sina source (主用)."""
+    import contextlib
+    import io
+
+    import akshare as ak
+
+    # 静音 akshare 内部 tqdm 分页进度条，避免污染简报输出
+    with contextlib.redirect_stderr(io.StringIO()):
+        df = ak.stock_zh_index_spot_sina()
+
+    targets = [
+        ("sh000001", "上证指数"),
+        ("sz399006", "创业板指"),
+        ("sh000688", "科创50"),
+    ]
+    rows = 0
+    fetch_time = bj_now()
+    for code, label in targets:
+        matched = df[df["代码"] == code]
+        if matched.empty:
+            continue
+        rec = matched.iloc[0]
+        price = float(rec["最新价"])
+        change_pct = float(rec["涨跌幅"])
+        # 新浪源不含行情时间字段，用快照抓取时间（北京时间）
+        print(
+            f"  {label}: {price:.2f}   {change_pct:+.2f}%   "
+            f"时间: {fetch_time}"
+        )
+        rows += 1
+
+    if rows == 0:
+        raise ValueError("新浪源中未找到目标指数 (sh000001/sz399006/sh000688)")
+
+
+def fetch_ashare_tencent():
+    """Fetch 上证指数 / 创业板指 / 科创50 from the Tencent quote API (备用)."""
     url = "https://qt.gtimg.cn/q=sh000001,sz399006,sh000688"
     resp = requests.get(url, timeout=TIMEOUT)
     resp.raise_for_status()
@@ -84,6 +120,15 @@ def fetch_ashare():
 
     if rows == 0:
         raise ValueError("未能解析出任何指数数据")
+
+
+def fetch_ashare():
+    """A股指数：优先 AKShare 新浪源，失败时回退腾讯接口。"""
+    try:
+        fetch_ashare_sina()
+    except Exception as exc:
+        print(f"  [提示] AKShare 新浪源失败: {exc}，回退腾讯接口", file=sys.stderr)
+        fetch_ashare_tencent()
 
 
 def fetch_gold():
