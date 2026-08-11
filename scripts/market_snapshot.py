@@ -150,7 +150,10 @@ def yahoo_quote(symbol):
     closes = [c for c in quote_data.get("close", []) if c is not None]
 
     close = meta.get("regularMarketPrice")
-    prev_close = meta.get("chartPreviousClose") or meta.get("previousClose")
+    # 注意：range=5d 时 chartPreviousClose 是窗口之前(5个交易日前)的收盘价，
+    # 不是前一个交易日——用它算"单日涨跌幅"会变成多日累计涨幅（2026-08-11 美股"暴涨"误报根因）。
+    # 一律用日K数据里倒数第二个收盘价（即前一个交易日）。
+    prev_close = closes[-2] if len(closes) >= 2 else (meta.get("chartPreviousClose") or meta.get("previousClose"))
     ts = meta.get("regularMarketTime")
 
     if close is None and closes:
