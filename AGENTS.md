@@ -30,3 +30,39 @@ CodeHub 是服务器上的统一代码仓库，存放所有由 Codex 编写的�
 ## Skill 共享说明
 
 Hermes 的部分 skill 通过软链共享到 `~/.codex/skills/`（如 vpn-proxy-server）。涉及这些领域（VPN/代理配置、行情数据等）时，Codex 应加载对应 skill 再动手，不要凭记忆瞎写。
+
+## GitHub 托管与分支协作规范（2026-08-12 用户定）
+
+仓库已托管到 GitHub：`git@github.com:qx921310/MyProject.git`（SSH）。Hermes（金仔）与 OpenClaw（钻仔）共同维护，**各自一个专属工作分支，合并到 main 前必须交叉 review**。
+
+### 分支约定
+
+- `main` — 合并目标（最终稳定版），**不直接在上面开发**
+- `hermes-main` — Hermes（金仔）专属工作分支，由搬瓦工 `/root/CodeHub` 推送
+- `diamond-main` — 钻仔（OpenClaw）专属工作分支，由首尔服务器推送
+- 每人在自己分支上开发；需要合入稳定版时，从自己分支向 `main` 开 Pull Request
+
+### 交叉 review 铁律（用户明确要求）
+
+1. **合并前必须 review**：任何分支向 `main` 的 PR，必须由**另一方**（不是作者自己）审查通过后才能合并
+   - Hermes 的 PR → 钻仔 review
+   - 钻仔的 PR → Hermes review
+2. **review 内容**：代码正确性、安全（敏感信息泄露）、与仓库规范的符合度；发现的问题在 PR 上指出，作者修复后再合
+3. **禁止自我合入**：作者不得在自己 review 自己的 PR（和本仓库"无代理自审"原则一致）
+4. 仓库级规则（本文件）与各分支内容冲突时，以本文件 + 用户最终决定为准
+
+### 日常流程（Hermes 侧）
+
+```bash
+cd /root/CodeHub
+git pull origin hermes-main        # 拉最新（含钻仔改动同步时）
+git add -A && git commit -m "..."  # 提交（仍走 requesting-code-review 管线）
+git push origin hermes-main        # 推到自己分支
+# 需要合入 main 时：开 PR，等钻仔 review
+```
+
+### 注意事项
+
+- 敏感信息（API key/密码/token）仍一律不入库（见工作规范第 2 条）；`projects/proxy/secrets/*.enc` 是 age 加密产物，**必须入库**（加密后的凭证），不要忽略也不要解密后提交
+- 钻仔首次接入：在首尔生成 GitHub SSH 密钥 → 公钥交用户加到 GitHub → 克隆仓库 → 建 `diamond-main` 分支
+- 分支同步：双方各自 push 后，如需在对方分支基础上工作，先 `git fetch origin && git checkout -b xxx origin/xxx` 或合并对方分支
