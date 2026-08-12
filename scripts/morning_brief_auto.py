@@ -12,6 +12,8 @@
 时间统一北京时间（UTC+8）。
 """
 
+import hashlib
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
@@ -33,6 +35,30 @@ TIMEOUT = 15
 
 def bj_now():
     return datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+FP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".morning_brief.fp")
+
+
+def fingerprint_guard(text):
+    """内容指纹去重：与上次指纹相同返回 False（调用方应静默退出，不推送）。
+
+    指纹只对数据内容计算，排除每次必变的「时间」行，
+    因此节假日/周末数据未变时自动跳过，不重复刷屏。
+    """
+    data_lines = [ln for ln in text.splitlines() if not ln.startswith("🕗")]
+    fp = hashlib.sha256("\n".join(data_lines).encode("utf-8")).hexdigest()
+    old = ""
+    try:
+        with open(FP_FILE, encoding="utf-8") as f:
+            old = f.read().strip()
+    except OSError:
+        pass
+    if fp == old:
+        return False
+    with open(FP_FILE, "w", encoding="utf-8") as f:
+        f.write(fp)
+    return True
 
 
 def fmt_num(value, digits=2):
@@ -205,7 +231,10 @@ def main():
     lines.append("")
     lines.append("（自动简报 · 无分析 · 数据仅供参考）")
 
-    print("\n".join(lines))
+    text = "\n".join(lines)
+    if not fingerprint_guard(text):
+        return  # 内容未变，静默跳过（no_agent 空输出=不推送）
+    print(text)
 
 
 if __name__ == "__main__":
