@@ -1,0 +1,16 @@
+# 敏感信息——永不入库
+.ssh/
+*.pem
+*.key
+.env
+*.tgz
+
+# 依赖与虚拟环境
+node_modules/
+.venv*/
+__pycache__/
+
+# 临时与备份
+.trash-*/
+backups/
+*.bak
