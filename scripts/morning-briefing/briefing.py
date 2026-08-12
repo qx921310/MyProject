@@ -16,15 +16,19 @@ A股简报自动推送脚本（钻仔 / 小钻钻）
 - 日志：logs/briefing.log，带操作人字段（钻仔）+ 北京时间（UTC+8）
 
 用法：
-  python3 briefing.py --mode morning            # 早盘推送
-  python3 briefing.py --mode close              # 收盘推送
-  python3 briefing.py --mode morning --dry-run  # 只生成文本打印，不推送
-  python3 briefing.py --mode morning --no-llm   # 强制纯模板（不调模型）
-  python3 briefing.py --mode morning --save     # 额外把数据源写入 logs/data/（供 bot 分析用）
+  python3 briefing.py --mode morning            # 抓数据+生成基础版+推送（旧行为，一般不直接用）
+  python3 briefing.py --mode morning --save --no-push   # 只抓数据存本地数据源（不推送）
+  python3 briefing.py --mode morning --dry-run # 只生成文本打印，不推送
+  python3 briefing.py --push-pending morning   # 读待推送文件并推送（定时推送用）
+  python3 briefing.py --mode morning --no-llm  # 强制纯模板（不调模型）
 
 数据源输出（--save）：
   写入 logs/data/latest-{mode}.json（结构化数据：指数/板块/涨跌家数/新闻/基础简报）
   和 logs/data/latest-{mode}.md（基础版简报文本），供钻仔/金仔各自基于数据做分析测评。
+
+待推送（--push-pending）：
+  读 logs/pending/{mode}.txt（AI 分析版）推送到群里，成功后归档；
+  若文件不存在则降级推送基础版，保证不漏推。
 """
 
 import argparse
@@ -42,6 +46,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE_DIR, "logs", "briefing.log")
 STATE_FILE = os.path.join(BASE_DIR, "logs", "briefing.state.json")
 DATA_DIR = os.path.join(BASE_DIR, "logs", "data")
+PENDING_DIR = os.path.join(BASE_DIR, "logs", "pending")
 OPENCLAW_JSON = "/home/node/.openclaw/openclaw.json"
 CHAT_ID = "oc_88de0009625d420532c0e0bd075c285e"  # 大威天龙群
 API_BASE = "https://open.feishu.cn/open-apis"
@@ -432,6 +437,43 @@ def feishu_send(text: str) -> bool:
     return True
 
 
+def push_pending(mode: str) -> int:
+    """读待推送分析版文件并推送到群里；文件缺失则降级推基础版。返回退出码。"""
+    pending_path = os.path.join(PENDING_DIR, f"{mode}.txt")
+    text = None
+    if os.path.exists(pending_path):
+        with open(pending_path, encoding="utf-8") as f:
+            text = f.read().strip()
+        if not text:
+            text = None
+    if text:
+        log(f"待推送分析版已就绪（{len(text)} 字），开始推送")
+    else:
+        # 降级：用数据源基础版推送，保证不漏
+        md_path = os.path.join(DATA_DIR, f"latest-{mode}.md")
+        if os.path.exists(md_path):
+            with open(md_path, encoding="utf-8") as f:
+                text = f.read().strip()
+            log(f"WARN 待推送分析版不存在，降级推送基础版")
+        else:
+            log(f"ERROR 待推送文件与数据源均不存在: {pending_path}")
+            return 1
+    try:
+        feishu_send(text)
+    except Exception as e:
+        log(f"ERROR 推送失败: {e}")
+        return 1
+    # 成功归档待推送文件
+    if os.path.exists(pending_path):
+        archive = f"{pending_path}.{datetime.now(TZ_UTC8).strftime('%Y%m%d%H%M%S')}.sent"
+        try:
+            os.rename(pending_path, archive)
+        except Exception as e:
+            log(f"WARN 归档待推送文件失败: {e}")
+    log(f"{mode} 推送成功 ✅")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
@@ -442,7 +484,15 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="只生成文本打印，不推送")
     parser.add_argument("--no-llm", action="store_true", help="强制纯模板，不调用模型")
     parser.add_argument("--save", action="store_true", help="把数据源基础版写入本地 logs/data/")
+    parser.add_argument("--no-push", action="store_true", help="抓数据+存数据源但不推送（基础版供 AI 分析用）")
+    parser.add_argument("--push-pending", choices=["morning", "close"], default=None,
+                        help="读 logs/pending/{mode}.txt 分析版推送（定时推送任务用）")
     args = parser.parse_args()
+
+    # 待推送模式：只负责按时把分析版推出去
+    if args.push_pending:
+        log(f"待推送任务开始 mode={args.push_pending}")
+        return push_pending(args.push_pending)
 
     log(f"A股简报任务开始 mode={args.mode}" + ("（dry-run）" if args.dry_run else "")
         + ("（--no-llm）" if args.no_llm else ""))
@@ -493,6 +543,10 @@ def main() -> int:
 
     if args.dry_run:
         log("dry-run 模式，不推送")
+        return 0
+
+    if args.no_push:
+        log("基础版不推送（--no-push），仅供 AI 分析用")
         return 0
 
     try:
