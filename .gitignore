@@ -1,18 +1,20 @@
-# 敏感信息
+# 敏感信息——永不入库
+.ssh/
 .env
 *.key
 *.pem
+*.tgz
 *_secret*
 credentials*
 token*
-
-# Python
+node_modules/
+.venv*/
+venv/
 __pycache__/
 *.pyc
-.venv/
-venv/
-
-# 临时文件
 *.tmp
 *.log
+.trash-*/
+backups/
+*.bak
 .DS_Store
