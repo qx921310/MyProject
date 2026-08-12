@@ -1,0 +1,14 @@
+# Hysteria2 客户端配置（CA 固定版，本地回环验证用，不依赖 insecure）
+# 用法: /usr/local/bin/hysteria client -c hysteria2-client.yaml
+# 本地 SOCKS5 代理: 127.0.0.1:1080
+
+server: {{SERVER_IP}}:{{HYSTERIA_PORT}}
+auth: {{HYSTERIA_AUTH_PASSWORD}}
+
+tls:
+  sni: {{HYSTERIA_TLS_SNI}}   # 必须与服务器证书 CN/伪装域名一致
+  ca: {{HYSTERIA_CERT}}       # CA 固定：部署时复制自 /etc/hysteria/server.crt
+# insecure: true              # 仅作最后手段，订阅产物为兼容旧客户端仍用 insecure=1
+
+socks5:
+  listen: 127.0.0.1:1080

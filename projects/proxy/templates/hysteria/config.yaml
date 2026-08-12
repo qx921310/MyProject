@@ -1,0 +1,17 @@
+listen: :{{HYSTERIA_PORT}}
+
+tls:
+  cert: {{HYSTERIA_CERT}}
+  key: {{HYSTERIA_KEY}}
+
+auth:
+  type: password
+  password: {{HYSTERIA_AUTH_PASSWORD}}
+
+masquerade:
+  type: proxy
+  proxy:
+    url: {{MASQUERADE_URL}}
+    rewriteHost: true
+
+fastOpen: true

@@ -1,0 +1,45 @@
+{
+  "log": {
+    "loglevel": "debug"
+  },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": {{XRAY_PORT}},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "{{XRAY_UUID}}",
+            "flow": "{{REALITY_FLOW}}"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "dest": "{{REALITY_DEST}}",
+          "serverNames": [
+            "{{REALITY_SERVER_NAME}}"
+          ],
+          "privateKey": "{{XRAY_PRIVATE_KEY}}",
+          "shortIds": [
+            "{{XRAY_SHORT_ID}}"
+          ]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
+  ]
+}

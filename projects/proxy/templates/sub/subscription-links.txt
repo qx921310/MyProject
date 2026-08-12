@@ -1,0 +1,16 @@
+# 订阅链接（自动生成,已加 token 防扫描）
+# 按客户端类型选择, 填进客户端的"订阅管理/添加订阅"即可
+
+# Clash Meta (mihomo / Clash Verge 等)
+{{SUB_BASE_URL}}/{{SUB_TOKEN}}/clash.yaml
+
+# v2rayN / NekoBox 等 (明文 URI)
+{{SUB_BASE_URL}}/{{SUB_TOKEN}}/sub.txt
+
+# 老式客户端 (base64)
+{{SUB_BASE_URL}}/{{SUB_TOKEN}}/sub64.txt
+
+# 节点直连链接 (手动导入用, 不依赖订阅服务)
+# Hysteria2 (UDP) 与 VLESS+Reality (TCP) 双节点; UDP 被运营商 QoS 限速时改用 my-node-tcp
+hysteria2://{{HYSTERIA_AUTH_PASSWORD}}@{{SERVER_IP}}:{{HYSTERIA_PORT}}?sni={{HYSTERIA_TLS_SNI}}&insecure=1#my-node
+vless://{{XRAY_UUID}}@{{SERVER_IP}}:{{XRAY_PORT}}?encryption=none&security=reality&sni={{REALITY_SERVER_NAME}}&fp={{CLIENT_FINGERPRINT}}&pbk={{XRAY_PUBLIC_KEY}}&sid={{XRAY_SHORT_ID}}&type=tcp&flow={{REALITY_FLOW}}#my-node-tcp

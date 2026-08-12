@@ -1,0 +1,39 @@
+# Clash Meta (mihomo) 订阅配置
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+
+proxies:
+  - name: my-node
+    type: hysteria2
+    server: {{SERVER_IP}}
+    port: {{HYSTERIA_PORT}}
+    password: {{HYSTERIA_AUTH_PASSWORD}}
+    sni: {{HYSTERIA_TLS_SNI}}
+    skip-cert-verify: true
+  - name: my-node-tcp
+    type: vless
+    server: {{SERVER_IP}}
+    port: {{XRAY_PORT}}
+    uuid: {{XRAY_UUID}}
+    network: tcp
+    udp: true
+    tls: true
+    flow: {{REALITY_FLOW}}
+    servername: {{REALITY_SERVER_NAME}}
+    client-fingerprint: {{CLIENT_FINGERPRINT}}
+    reality-opts:
+      public-key: {{XRAY_PUBLIC_KEY}}
+      short-id: {{XRAY_SHORT_ID}}
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - my-node-tcp
+      - my-node
+      - DIRECT
+
+rules:
+  - MATCH,PROXY

@@ -1,0 +1,8 @@
+# 节点直连链接 (手动导入用, 不依赖订阅服务)
+# 注意: 如遇 UDP 被运营商 QoS 导致 Hysteria2 慢, 请用 my-node-tcp (VLESS+Reality, 走 TCP)
+
+# Hysteria2 (UDP, {{HYSTERIA_PORT}})
+hysteria2://{{HYSTERIA_AUTH_PASSWORD}}@{{SERVER_IP}}:{{HYSTERIA_PORT}}?sni={{HYSTERIA_TLS_SNI}}&insecure=1#my-node
+
+# VLESS + Reality (TCP, {{XRAY_PORT}}) —— UDP 被限速时的首选
+vless://{{XRAY_UUID}}@{{SERVER_IP}}:{{XRAY_PORT}}?encryption=none&security=reality&sni={{REALITY_SERVER_NAME}}&fp={{CLIENT_FINGERPRINT}}&pbk={{XRAY_PUBLIC_KEY}}&sid={{XRAY_SHORT_ID}}&type=tcp&flow={{REALITY_FLOW}}#my-node-tcp

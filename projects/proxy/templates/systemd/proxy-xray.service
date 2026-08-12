@@ -1,0 +1,17 @@
+[Unit]
+Description=Proxy Xray Service (VLESS+Reality, project-managed)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/xray/xray run -c /etc/proxy/xray/config.json
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+
+# 说明：与旧 xray.service 保持同权（root）以便行为完全一致。
+# 降权（User=xray + NoNewPrivileges + capability 裁剪）列为后续改进，
+# 需 Hermes 决策后单独实施，见 docs/architecture.md「安全基线待办」。

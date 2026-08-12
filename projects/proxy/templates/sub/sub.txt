@@ -1,0 +1,2 @@
+hysteria2://{{HYSTERIA_AUTH_PASSWORD}}@{{SERVER_IP}}:{{HYSTERIA_PORT}}?sni={{HYSTERIA_TLS_SNI}}&insecure=1#my-node
+vless://{{XRAY_UUID}}@{{SERVER_IP}}:{{XRAY_PORT}}?encryption=none&security=reality&sni={{REALITY_SERVER_NAME}}&fp={{CLIENT_FINGERPRINT}}&pbk={{XRAY_PUBLIC_KEY}}&sid={{XRAY_SHORT_ID}}&type=tcp&flow={{REALITY_FLOW}}#my-node-tcp

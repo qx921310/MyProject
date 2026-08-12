@@ -1,0 +1,14 @@
+[Unit]
+Description=Proxy Subscription File Server (project-managed)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m http.server {{SUB_SERVER_PORT}} --bind 0.0.0.0 --directory /etc/proxy/sub
+User=nobody
+Group=nogroup
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

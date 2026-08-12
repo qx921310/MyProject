@@ -1,0 +1,11 @@
+# 明文、运行时产物、临时文件：永不入库
+.env
+.env.*
+!.env.example
+*.tmp
+*.log
+__pycache__/
+*.pyc
+runtime/
+
+# 注意：secrets/*.enc 必须入库（这是加密后的唯一明文替代品），不要忽略
