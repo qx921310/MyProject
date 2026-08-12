@@ -39,7 +39,7 @@ Hermes 的部分 skill 通过软链共享到 `~/.codex/skills/`（如 vpn-proxy-
 
 - `main` — 合并目标（最终稳定版），**不直接在上面开发**
 - `hermes-main` — Hermes（金仔）专属工作分支，由搬瓦工 `/root/CodeHub` 推送
-- `diamond-main` — 钻仔（OpenClaw）专属工作分支，由首尔服务器推送
+- `openclaw-main` — 钻仔（OpenClaw）专属工作分支，由首尔服务器推送
 - 每人在自己分支上开发；需要合入稳定版时，从自己分支向 `main` 开 Pull Request
 
 ### 交叉 review 铁律（用户明确要求）
@@ -64,5 +64,5 @@ git push origin hermes-main        # 推到自己分支
 ### 注意事项
 
 - 敏感信息（API key/密码/token）仍一律不入库（见工作规范第 2 条）；`projects/proxy/secrets/*.enc` 是 age 加密产物，**必须入库**（加密后的凭证），不要忽略也不要解密后提交
-- 钻仔首次接入：在首尔生成 GitHub SSH 密钥 → 公钥交用户加到 GitHub → 克隆仓库 → 建 `diamond-main` 分支
+- 钻仔首次接入：在首尔生成 GitHub SSH 密钥 → 公钥交用户加到 GitHub → 克隆仓库 → 建 `openclaw-main` 分支
 - 分支同步：双方各自 push 后，如需在对方分支基础上工作，先 `git fetch origin && git checkout -b xxx origin/xxx` 或合并对方分支
