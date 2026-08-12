@@ -20,6 +20,11 @@ A股简报自动推送脚本（钻仔 / 小钻钻）
   python3 briefing.py --mode close              # 收盘推送
   python3 briefing.py --mode morning --dry-run  # 只生成文本打印，不推送
   python3 briefing.py --mode morning --no-llm   # 强制纯模板（不调模型）
+  python3 briefing.py --mode morning --save     # 额外把数据源写入 logs/data/（供 bot 分析用）
+
+数据源输出（--save）：
+  写入 logs/data/latest-{mode}.json（结构化数据：指数/板块/涨跌家数/新闻/基础简报）
+  和 logs/data/latest-{mode}.md（基础版简报文本），供钻仔/金仔各自基于数据做分析测评。
 """
 
 import argparse
@@ -36,6 +41,7 @@ from datetime import datetime, timedelta, timezone
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE_DIR, "logs", "briefing.log")
 STATE_FILE = os.path.join(BASE_DIR, "logs", "briefing.state.json")
+DATA_DIR = os.path.join(BASE_DIR, "logs", "data")
 OPENCLAW_JSON = "/home/node/.openclaw/openclaw.json"
 CHAT_ID = "oc_88de0009625d420532c0e0bd075c285e"  # 大威天龙群
 API_BASE = "https://open.feishu.cn/open-apis"
@@ -332,6 +338,31 @@ def build_morning(indices: list[dict], sectors: list[dict],
     return "\n".join(lines)
 
 
+def save_data_source(mode: str, indices: list[dict], up_sectors: list[dict],
+                     down_sectors: list[dict], breadth: dict, news: list[dict],
+                     briefing: str) -> str:
+    """把数据源基础版写入本地 logs/data/，返回主文件路径。"""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    payload = {
+        "mode": mode,
+        "time": now_beijing(),
+        "indices": indices,
+        "up_sectors": up_sectors,
+        "down_sectors": down_sectors,
+        "breadth": breadth,
+        "news": news,
+        "briefing": briefing,
+    }
+    json_path = os.path.join(DATA_DIR, f"latest-{mode}.json")
+    md_path = os.path.join(DATA_DIR, f"latest-{mode}.md")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(briefing + "\n")
+    log(f"数据源已写入: {json_path}")
+    return json_path
+
+
 def build_close(indices: list[dict], up_sectors: list[dict], down_sectors: list[dict],
                 breadth: dict, news: list[dict], analysis: str | None) -> str:
     lines = ["📊 收盘简报 · " + now_beijing() + "（北京时间）", "━━━━━━━━━━━━━━"]
@@ -410,6 +441,7 @@ def main() -> int:
                         help="morning=早盘(09:20)，close=收盘(15:20)")
     parser.add_argument("--dry-run", action="store_true", help="只生成文本打印，不推送")
     parser.add_argument("--no-llm", action="store_true", help="强制纯模板，不调用模型")
+    parser.add_argument("--save", action="store_true", help="把数据源基础版写入本地 logs/data/")
     args = parser.parse_args()
 
     log(f"A股简报任务开始 mode={args.mode}" + ("（dry-run）" if args.dry_run else "")
@@ -443,6 +475,10 @@ def main() -> int:
         return 1
 
     log("简报生成成功：\n" + briefing)
+
+    # 数据源输出（不推送也保存，供 bot 分析用）
+    if args.save:
+        save_data_source(args.mode, indices, up_sectors, down_sectors, breadth, news, briefing)
 
     # 去重：按模式分别记录指纹
     fingerprint = hashlib.sha256(briefing.encode("utf-8")).hexdigest()
