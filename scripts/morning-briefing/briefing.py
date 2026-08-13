@@ -4,7 +4,8 @@
 A股简报自动推送脚本（钻仔 / 小钻钻）
 =========================================
 - 数据源（免费，零 token）：
-    腾讯行情接口（三大指数）+ 东方财富接口（行业板块涨跌幅榜、涨跌家数、7x24 快讯）
+    腾讯行情接口（三大指数，东财兜底）+ 东方财富接口（行业板块涨跌幅榜、涨跌家数、7x24 快讯）；
+    东财 5xx 时自动切换腾讯行业板块/全 A 涨跌家数，快讯失败降级为空。
 - 行情分析（轻量模型直连，每次约 0.3 美分，远低于完整 agent）：
     DeepSeek chat completions，key 读自 openclaw.json env.vars.DEEPSEEK_API_KEY（不回显）
 - 推送：飞书开放平台 API 发送到「大威天龙」群（凭据读自 openclaw.json，不回显）
@@ -32,10 +33,14 @@ A股简报自动推送脚本（钻仔 / 小钻钻）
 """
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
 import sys
+import tempfile
+import time
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -45,24 +50,50 @@ from datetime import datetime, timedelta, timezone
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE_DIR, "logs", "briefing.log")
 STATE_FILE = os.path.join(BASE_DIR, "logs", "briefing.state.json")
+DEGRADE_STATE_FILE = os.path.join(BASE_DIR, "logs", "degrade_state.json")
 DATA_DIR = os.path.join(BASE_DIR, "logs", "data")
 PENDING_DIR = os.path.join(BASE_DIR, "logs", "pending")
-OPENCLAW_JSON = "/home/node/.openclaw/openclaw.json"
+OPENCLAW_JSON_CANDIDATES = (
+    "/home/ubuntu/.openclaw/openclaw.json",
+    "/home/node/.openclaw/openclaw.json",
+    os.path.expanduser("~/.openclaw/openclaw.json"),
+)
 CHAT_ID = "oc_88de0009625d420532c0e0bd075c285e"  # 大威天龙群
 API_BASE = "https://open.feishu.cn/open-apis"
 OPERATOR = "钻仔"  # KOKO 立规：日志必须带操作人字段
 
+# 连续降级告警阈值：同一数据源降级按自然日累计，达到阈值后升级 ERROR 并写入简报。
+DEGRADE_ALERT_THRESHOLD = 3
+# 腾讯全 A 涨跌家数兜底的分页统计总耗时上限，防止慢接口拖垮简报任务。
+BREADTH_QQ_MAX_SECONDS = 60
+BREADTH_QQ_MAX_PAGES = 28
+BREADTH_QQ_PAGE_TIMEOUT = 15
+
 TZ_UTC8 = timezone(timedelta(hours=8))
 
 INDEX_QQ = "https://qt.gtimg.cn/q=sh000001,sz399001,sz399006"
+INDEX_EM = (
+    "https://push2.eastmoney.com/api/qt/ulist.np/get?"
+    "fltt=2&invt=2&fields=f2,f3,f4,f12,f14,f15,f16,f17,f18"
+    "&secids=1.000001,0.399001,0.399006"
+)
 SECTOR_EM = (
     "https://push2.eastmoney.com/api/qt/clist/get?"
     "pn=1&pz=8&po={po}&np=1&fltt=2&invt=2&fid=f3&fs=m:90+t:2"
     "&fields=f2,f3,f4,f12,f14"
 )
+SECTOR_QQ = (
+    "https://proxy.finance.qq.com/cgi/cgi-bin/rank/pt/getRank?"
+    "board_type=hy&sort_type=priceRatio&direct={direct}&offset=0&count={count}"
+)
 BREADTH_EM = (
     "https://push2.eastmoney.com/api/qt/ulist.np/get?"
     "fltt=2&invt=2&fields=f104,f105,f106&secids=1.000001"
+)
+BREADTH_QQ = (
+    "https://proxy.finance.qq.com/cgi/cgi-bin/rank/hs/getBoardRankList?"
+    "_appver=11.17.0&board_code=aStock&sort_type=priceRatio&direct=down"
+    "&offset={offset}&count={count}"
 )
 NEWS_EM = (
     "https://np-weblist.eastmoney.com/comm/web/getFastNewsList?"
@@ -102,10 +133,151 @@ def log(msg: str) -> None:
         print(f"[log-write-failed] {e}", flush=True)
 
 
-def http_get(url: str, timeout: int = 15) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+def _note_degradation(degradations: list[str] | None, reason: str) -> None:
+    """把降级原因追加到本次运行收集器中，供连续降级状态更新使用。"""
+    if degradations is not None:
+        degradations.append(reason)
+
+
+def _load_degrade_state() -> dict:
+    try:
+        with open(DEGRADE_STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_degrade_state(state: dict) -> None:
+    """原子写入降级状态：临时文件 + os.replace，避免并发/中断产生半截文件。"""
+    tmp_path = None
+    try:
+        state_dir = os.path.dirname(DEGRADE_STATE_FILE)
+        os.makedirs(state_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".degrade_state.", suffix=".tmp", dir=state_dir)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, DEGRADE_STATE_FILE)
+        tmp_path = None
+    except Exception as e:
+        log(f"WARN 连续降级状态写入失败: {e}")
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _lock_degrade_state():
+    """锁定降级状态文件，覆盖 load-modify-save 全流程，防止并发丢更新。"""
+    fd = None
+    try:
+        os.makedirs(os.path.dirname(DEGRADE_STATE_FILE), exist_ok=True)
+        fd = os.open(DEGRADE_STATE_FILE + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+    except Exception as e:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        log(f"WARN 连续降级状态加锁失败，本次更新不做并发保护: {e}")
+        return None
+
+
+def _unlock_degrade_state(lock_fd) -> None:
+    if lock_fd is None:
+        return
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+
+
+def update_degradation_state(degradations: list[str]) -> int:
+    """按自然日累计连续降级天数；同一自然日多次运行只计一次。返回当前连续天数。"""
+    today = datetime.now(TZ_UTC8).strftime("%Y-%m-%d")
+    lock_fd = _lock_degrade_state()
+    try:
+        state = _load_degrade_state()
+        last_date = state.get("date")
+        last_count = 0
+        try:
+            last_count = int(state.get("count") or 0)
+        except (TypeError, ValueError):
+            last_count = 0
+
+        if degradations:
+            if last_date == today:
+                consecutive = max(last_count, 1)
+            else:
+                consecutive = last_count + 1
+            state["date"] = today
+            state["count"] = consecutive
+            state["last_reasons"] = list(dict.fromkeys(degradations))[:10]
+        elif last_date == today:
+            # 同一自然日先降级后成功：成功只记录 last_ok，不清零当天降级计数。
+            state["last_ok"] = today
+            consecutive = last_count
+        else:
+            state["date"] = today
+            state["count"] = 0
+            state["last_ok"] = today
+            state["last_reasons"] = []
+            consecutive = 0
+
+        _save_degrade_state(state)
+    finally:
+        _unlock_degrade_state(lock_fd)
+    return consecutive
+
+
+def http_get(url: str, timeout: int = 15, retries: int = 2) -> bytes:
+    """GET 请求，带短重试。5xx/429/408/网络错误最多重试 retries 次。"""
+    host = urllib.parse.urlparse(url).hostname or ""
+    headers = {"User-Agent": USER_AGENT}
+    if "eastmoney" in host:
+        headers["Referer"] = "https://quote.eastmoney.com"
+    elif "gtimg" in host or "qq.com" in host:
+        headers["Referer"] = "https://finance.qq.com"
+
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            last_error = e
+            if e.code not in (408, 429, 500, 502, 503, 504):
+                raise
+        except Exception as e:  # URLError / timeout / connection reset 等
+            last_error = e
+        if attempt < retries:
+            time.sleep(0.3 * (2 ** attempt))
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"GET 失败: {url}")
+
+
+def find_openclaw_json() -> str:
+    """动态探测 openclaw.json：优先新主机路径，兼容旧容器路径。"""
+    seen = set()
+    for path in OPENCLAW_JSON_CANDIDATES:
+        if path in seen:
+            continue
+        seen.add(path)
+        if os.path.isfile(path):
+            log(f"openclaw.json 使用: {path}")
+            return path
+    attempted = "、".join(OPENCLAW_JSON_CANDIDATES)
+    raise FileNotFoundError(f"未找到 openclaw.json，已尝试: {attempted}")
 
 
 def http_post_json(url: str, payload: dict, headers: dict, timeout: int = 30) -> dict:
@@ -126,9 +298,8 @@ def now_beijing() -> str:
 # ---------------------------------------------------------------------------
 # 数据抓取
 # ---------------------------------------------------------------------------
-def fetch_indices() -> list[dict]:
-    """腾讯行情接口：三大指数数据。"""
-    raw = http_get(INDEX_QQ).decode("gbk", errors="replace")
+def _parse_qq_indices(raw: str) -> list[dict]:
+    """解析腾讯 qt.gtimg.cn 指数行情。"""
     result = []
     for line in raw.strip().split(";"):
         line = line.strip()
@@ -153,11 +324,53 @@ def fetch_indices() -> list[dict]:
             "change": change, "pct": pct, "high": high, "low": low,
         })
     if len(result) < 3:
-        raise RuntimeError(f"指数解析异常，仅拿到 {len(result)} 条")
+        raise RuntimeError(f"腾讯指数解析异常，仅拿到 {len(result)} 条")
     return result
 
 
-def fetch_sectors(po: int = 1, top: int = 5) -> list[dict]:
+def _parse_em_indices(raw: str) -> list[dict]:
+    """解析东财 ulist.np 指数行情。"""
+    data = json.loads(raw)
+    diff = (data.get("data") or {}).get("diff") or []
+    result = []
+    for item in diff:
+        try:
+            price = float(item["f2"])
+            prev_close = float(item["f18"])
+            pct = float(item["f3"])
+            change = float(item["f4"])
+            high = float(item["f15"])
+            low = float(item["f16"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise RuntimeError(f"东财指数字段解析异常: {e}")
+        result.append({
+            "name": item.get("f14", ""),
+            "price": price,
+            "prev_close": prev_close,
+            "change": change,
+            "pct": pct,
+            "high": high,
+            "low": low,
+        })
+    if len(result) < 3:
+        raise RuntimeError(f"东财指数解析异常，仅拿到 {len(result)} 条")
+    return result
+
+
+def fetch_indices() -> list[dict]:
+    """三大指数：腾讯优先，东财兜底。"""
+    try:
+        return _parse_qq_indices(http_get(INDEX_QQ).decode("gbk", errors="replace"))
+    except Exception as e:
+        log(f"WARN 腾讯指数抓取失败，切换东财指数兜底: {e}")
+    try:
+        return _parse_em_indices(http_get(INDEX_EM).decode("utf-8", errors="replace"))
+    except Exception as e:
+        log(f"ERROR 东财指数兜底也失败: {e}")
+        raise
+
+
+def fetch_sectors_em(po: int = 1, top: int = 5) -> list[dict]:
     """东方财富行业板块榜单。po=1 涨幅榜，po=0 跌幅榜。"""
     raw = http_get(SECTOR_EM.format(po=po)).decode("utf-8", errors="replace")
     data = json.loads(raw)
@@ -170,16 +383,59 @@ def fetch_sectors(po: int = 1, top: int = 5) -> list[dict]:
             result.append({"name": name, "pct": float(pct)})
         if len(result) >= top:
             break
+    if not result:
+        raise RuntimeError("东财板块榜单为空")
     return result
 
 
-def fetch_breadth() -> dict:
-    """上证涨跌家数：f104 上涨 / f105 下跌 / f106 平盘。"""
+def fetch_sectors_qq(direction: str, top: int = 5) -> list[dict]:
+    """腾讯行业板块榜单。direction: up=领涨，down=领跌。"""
+    direct = "down" if direction == "up" else "up"
+    raw = http_get(SECTOR_QQ.format(direct=direct, count=top)).decode("utf-8", errors="replace")
+    data = json.loads(raw)
+    if data.get("code") != 0:
+        raise RuntimeError(f"腾讯板块接口错误: code={data.get('code')} msg={data.get('msg')}")
+    rank_list = (data.get("data") or {}).get("rank_list") or []
+    result = []
+    for item in rank_list:
+        name = item.get("name", "")
+        pct = item.get("zdf")
+        if name and pct is not None:
+            try:
+                result.append({"name": name, "pct": float(pct)})
+            except (TypeError, ValueError):
+                continue
+        if len(result) >= top:
+            break
+    if not result:
+        raise RuntimeError("腾讯板块榜单为空")
+    return result
+
+
+def fetch_sectors_with_source(po: int = 1, top: int = 5,
+                              degradations: list[str] | None = None) -> tuple[list[dict], str]:
+    """行业板块榜单：东财优先，失败自动切换腾讯；双失败返回空列表。"""
+    direction = "up" if po == 1 else "down"
+    try:
+        return fetch_sectors_em(po, top), "东方财富"
+    except Exception as e:
+        _note_degradation(degradations, f"东财{'领涨' if po == 1 else '领跌'}板块失败，已降级腾讯")
+        log(f"WARN 东财{'领涨' if po == 1 else '领跌'}板块抓取失败，切换腾讯板块兜底: {e}")
+    try:
+        return fetch_sectors_qq(direction, top), "腾讯"
+    except Exception as e:
+        _note_degradation(degradations, f"腾讯{direction}板块失败，{'领涨' if po == 1 else '领跌'}板块置空")
+        log(f"WARN 腾讯{direction}板块抓取也失败，该板块字段将置空: {e}")
+        return [], "不可用"
+
+
+def fetch_breadth_em() -> dict:
+    """东财上证涨跌家数：f104 上涨 / f105 下跌 / f106 平盘。"""
     raw = http_get(BREADTH_EM).decode("utf-8", errors="replace")
     data = json.loads(raw)
     diff = (data.get("data") or {}).get("diff") or []
     if not diff:
-        raise RuntimeError("涨跌家数解析异常")
+        raise RuntimeError("东财涨跌家数解析异常")
     item = diff[0]
     return {
         "up": int(item.get("f104", 0)),
@@ -188,25 +444,98 @@ def fetch_breadth() -> dict:
     }
 
 
-def fetch_news(top: int = 8) -> list[dict]:
-    """东财 7x24 快讯，按财经相关性关键词过滤。"""
-    raw = http_get(NEWS_EM).decode("utf-8", errors="replace")
-    data = json.loads(raw)
-    items = (data.get("data") or {}).get("fastNewsList") or []
-    result = []
-    for it in items:
-        title = (it.get("title") or "").strip()
-        if not title:
-            title = (it.get("summary") or "").strip()
-        if not title:
-            continue
-        if not any(kw in title for kw in FIN_KEYWORDS):
-            continue
-        show_time = (it.get("showTime") or "")[5:16]  # MM-DD HH:MM
-        result.append({"time": show_time, "title": title})
-        if len(result) >= top:
+def fetch_breadth_qq() -> dict:
+    """腾讯全 A 涨跌家数兜底：按股票涨跌幅排行分页统计。"""
+    up = down = flat = 0
+    offset = 0
+    pages = 0
+    deadline = time.monotonic() + BREADTH_QQ_MAX_SECONDS
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(f"腾讯涨跌家数统计超过 {BREADTH_QQ_MAX_SECONDS}s 上限")
+        url = BREADTH_QQ.format(offset=offset, count=200)
+        raw = http_get(url, timeout=min(remaining, BREADTH_QQ_PAGE_TIMEOUT), retries=1).decode("utf-8", errors="replace")
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"腾讯涨跌家数统计超过 {BREADTH_QQ_MAX_SECONDS}s 上限")
+        data = json.loads(raw)
+        if data.get("code") != 0:
+            raise RuntimeError(f"腾讯涨跌家数接口错误: code={data.get('code')} msg={data.get('msg')}")
+        body = data.get("data") or {}
+        items = body.get("rank_list") or []
+        if not items:
             break
-    return result
+        for item in items:
+            if item.get("state") == "S":
+                continue
+            zdf_raw = item.get("zdf")
+            if zdf_raw is None or zdf_raw == "":
+                continue
+            try:
+                zdf = float(zdf_raw)
+            except (TypeError, ValueError):
+                continue
+            if zdf > 0:
+                up += 1
+            elif zdf < 0:
+                down += 1
+            else:
+                flat += 1
+        pages += 1
+        offset += len(items)
+        total = int(body.get("total") or 0)
+        natural_done = len(items) < 200 or (total and offset >= total)
+        if natural_done or pages >= BREADTH_QQ_MAX_PAGES:
+            if not natural_done:
+                log(f"WARN 腾讯涨跌家数统计达到 BREADTH_QQ_MAX_PAGES={BREADTH_QQ_MAX_PAGES} 上限，结果已截断，可能偏少")
+            break
+    if pages == 0:
+        raise RuntimeError("腾讯涨跌家数统计无数据")
+    return {"up": up, "down": down, "flat": flat}
+
+
+def fetch_breadth_with_source(degradations: list[str] | None = None) -> tuple[dict, str]:
+    """涨跌家数：东财优先，失败自动切换腾讯全 A；双失败返回占位数据。"""
+    try:
+        return fetch_breadth_em(), "东方财富"
+    except Exception as e:
+        _note_degradation(degradations, "东财涨跌家数失败，已降级腾讯全A")
+        log(f"WARN 东财涨跌家数抓取失败，切换腾讯全 A 口径兜底: {e}")
+    try:
+        return fetch_breadth_qq(), "腾讯全A"
+    except Exception as e:
+        _note_degradation(degradations, "腾讯全A涨跌家数失败，字段置空")
+        log(f"WARN 腾讯涨跌家数抓取也失败，该字段将置空: {e}")
+        return {"up": 0, "down": 0, "flat": 0}, "不可用"
+
+
+def fetch_news(top: int = 8, degradations: list[str] | None = None) -> list[dict]:
+    """东财 7x24 快讯，按财经相关性关键词过滤；失败降级为空消息面。"""
+    try:
+        raw = http_get(NEWS_EM).decode("utf-8", errors="replace")
+        data = json.loads(raw)
+        items = (data.get("data") or {}).get("fastNewsList") or []
+        result = []
+        for it in items:
+            title = (it.get("title") or "").strip()
+            if not title:
+                title = (it.get("summary") or "").strip()
+            if not title:
+                continue
+            if not any(kw in title for kw in FIN_KEYWORDS):
+                continue
+            show_time = (it.get("showTime") or "")[5:16]  # MM-DD HH:MM
+            result.append({"time": show_time, "title": title})
+            if len(result) >= top:
+                break
+        if not result:
+            _note_degradation(degradations, "东财快讯为空，消息面置空")
+            log("WARN 东财快讯为空，消息面将置空")
+        return result
+    except Exception as e:
+        _note_degradation(degradations, "东财快讯失败，消息面置空")
+        log(f"WARN 东财快讯抓取失败，消息面降级为空: {e}")
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +543,7 @@ def fetch_news(top: int = 8) -> list[dict]:
 # ---------------------------------------------------------------------------
 def _load_deepseek_config() -> tuple[str, str, str]:
     """返回 (api_key, base_url, model_id)，均从 openclaw.json 读取。"""
-    with open(OPENCLAW_JSON, encoding="utf-8") as f:
+    with open(find_openclaw_json(), encoding="utf-8") as f:
         cfg = json.load(f)
     api_key = (cfg.get("env", {}).get("vars", {}) or {}).get("DEEPSEEK_API_KEY", "")
     models_cfg = cfg.get("models", {}) or {}
@@ -230,7 +559,9 @@ def _load_deepseek_config() -> tuple[str, str, str]:
 
 
 def llm_analyze(mode: str, indices: list[dict], up_sectors: list[dict],
-                down_sectors: list[dict], breadth: dict, news: list[dict]) -> str:
+                down_sectors: list[dict], breadth: dict, news: list[dict],
+                up_source: str = "东方财富", down_source: str = "东方财富",
+                breadth_source: str = "东方财富") -> str:
     """调用 DeepSeek 生成行情分析（150 字内）。失败抛异常由调用方降级。"""
     api_key, base_url, model_id = _load_deepseek_config()
     if not api_key:
@@ -239,21 +570,52 @@ def llm_analyze(mode: str, indices: list[dict], up_sectors: list[dict],
     idx_lines = "；".join(
         f"{i['name']} {i['price']:.2f} ({i['pct']:+.2f}%)" for i in indices
     )
-    up_lines = "、".join(f"{s['name']}{s['pct']:+.2f}%" for s in up_sectors[:5]) or "无"
-    down_lines = "、".join(f"{s['name']}{s['pct']:+.2f}%" for s in down_sectors[:5]) or "无"
+    up_lines = "、".join(f"{s['name']}{s['pct']:+.2f}%" for s in up_sectors[:5])
+    down_lines = "、".join(f"{s['name']}{s['pct']:+.2f}%" for s in down_sectors[:5])
     news_lines = "\n".join(f"{n['time']} {n['title']}" for n in news[:8]) or "无"
 
+    if up_source == "不可用" or not up_sectors:
+        up_block = "【领涨板块】数据不可用（东财与腾讯均失败），请勿引用该字段。"
+    else:
+        up_block = f"【领涨板块（{up_source}口径）】{up_lines or '无'}"
+    if down_source == "不可用" or not down_sectors:
+        if mode == "morning":
+            down_block = "【领跌板块】数据不可用（早盘模式不取该字段），请勿引用该字段。"
+        else:
+            down_block = "【领跌板块】数据不可用（东财与腾讯均失败），请勿引用该字段。"
+    else:
+        down_block = f"【领跌板块（{down_source}口径）】{down_lines or '无'}"
+
+    if mode == "close":
+        if breadth_source == "不可用":
+            breadth_block = "【涨跌家数】数据不可用（东财与腾讯全A均失败），请勿引用该字段。"
+        else:
+            breadth_label = "东方财富上证口径" if breadth_source == "东方财富" else f"{breadth_source}口径"
+            breadth_block = (
+                f"【涨跌家数（{breadth_label}）】"
+                f"上涨{breadth['up']}/下跌{breadth['down']}/平盘{breadth['flat']}"
+            )
+    else:
+        breadth_block = None
+
     mode_label = "早盘" if mode == "morning" else "收盘"
+    data_blocks = [
+        f"【指数】{idx_lines}",
+        up_block,
+        down_block,
+    ]
+    if breadth_block:
+        data_blocks.append(breadth_block)
+    data_blocks.append(f"【财经快讯】\n{news_lines}")
+    data_lines = "\n".join(data_blocks)
+
     prompt = (
         f"你是严谨的A股分析师。基于以下【真实数据】和【财经快讯】写{mode_label}行情分析，"
         f"不超过150字，中文，只输出分析正文。要求：①先给一句话盘面强弱判断；"
         f"②指出主线板块与逻辑；③挑1-2条关键消息面并说明对盘面的潜在影响；"
-        f"④不给买卖建议。严禁编造数据，只使用提供的信息。\n\n"
-        f"【指数】{idx_lines}\n"
-        f"【涨跌家数】上涨{breadth['up']}/下跌{breadth['down']}/平盘{breadth['flat']}\n"
-        f"【领涨板块】{up_lines}\n"
-        f"【领跌板块】{down_lines}\n"
-        f"【财经快讯】\n{news_lines}"
+        f"④不给买卖建议。严禁编造数据，只使用提供的信息；"
+        f"若某字段标注数据不可用，则不要引用该字段。\n\n"
+        f"{data_lines}"
     )
 
     payload = {
@@ -320,14 +682,20 @@ def _news_block(news: list[dict]) -> list[str]:
 
 
 def build_morning(indices: list[dict], sectors: list[dict],
-                  news: list[dict], analysis: str | None) -> str:
+                  news: list[dict], analysis: str | None,
+                  sector_source: str = "东方财富",
+                  alert: str | None = None) -> str:
     lines = ["📊 早盘简报 · " + now_beijing() + "（北京时间）", "━━━━━━━━━━━━━━"]
     lines += _fmt_indices(indices)
     if sectors:
         lines.append("━━━━━━━━━━━━━━")
-        lines.append("🔥 领涨板块：")
+        label = "🔥 领涨板块：" if sector_source == "东方财富" else f"🔥 领涨板块（{sector_source}口径）："
+        lines.append(label)
         for i, s in enumerate(sectors, 1):
             lines.append(f"{i}. {s['name']} {s['pct']:+.2f}%")
+    else:
+        lines.append("━━━━━━━━━━━━━━")
+        lines.append("🔥 领涨板块：数据源暂不可用")
     news_lines = _news_block(news)
     if news_lines:
         lines.append("━━━━━━━━━━━━━━")
@@ -339,13 +707,15 @@ def build_morning(indices: list[dict], sectors: list[dict],
         lines.append(f"💡 简评：{_mood_line([i['pct'] for i in indices])}；"
                      f"资金主线集中在「{sectors[0]['name']}」方向。" if sectors else
                      f"💡 简评：{_mood_line([i['pct'] for i in indices])}。")
+    if alert:
+        lines.append(alert)
     lines.append("⚠️ 数据仅供参考，不构成投资建议。")
     return "\n".join(lines)
 
 
 def save_data_source(mode: str, indices: list[dict], up_sectors: list[dict],
                      down_sectors: list[dict], breadth: dict, news: list[dict],
-                     briefing: str) -> str:
+                     briefing: str, sources: dict | None = None) -> str:
     """把数据源基础版写入本地 logs/data/，返回主文件路径。"""
     os.makedirs(DATA_DIR, exist_ok=True)
     payload = {
@@ -357,6 +727,7 @@ def save_data_source(mode: str, indices: list[dict], up_sectors: list[dict],
         "breadth": breadth,
         "news": news,
         "briefing": briefing,
+        "sources": sources or {},
     }
     json_path = os.path.join(DATA_DIR, f"latest-{mode}.json")
     md_path = os.path.join(DATA_DIR, f"latest-{mode}.md")
@@ -369,21 +740,35 @@ def save_data_source(mode: str, indices: list[dict], up_sectors: list[dict],
 
 
 def build_close(indices: list[dict], up_sectors: list[dict], down_sectors: list[dict],
-                breadth: dict, news: list[dict], analysis: str | None) -> str:
+                breadth: dict, news: list[dict], analysis: str | None,
+                up_source: str = "东方财富", down_source: str = "东方财富",
+                breadth_source: str = "东方财富",
+                alert: str | None = None) -> str:
     lines = ["📊 收盘简报 · " + now_beijing() + "（北京时间）", "━━━━━━━━━━━━━━"]
     lines += _fmt_indices(indices)
     lines.append("━━━━━━━━━━━━━━")
-    lines.append(f"📈 涨跌家数：上涨 {breadth['up']} / 下跌 {breadth['down']} / 平盘 {breadth['flat']}")
+    if breadth_source == "不可用":
+        lines.append("📈 涨跌家数：数据源暂不可用")
+    elif breadth_source == "东方财富":
+        lines.append(f"📈 涨跌家数：上涨 {breadth['up']} / 下跌 {breadth['down']} / 平盘 {breadth['flat']}")
+    else:
+        lines.append(f"📈 涨跌家数（{breadth_source}口径）：上涨 {breadth['up']} / 下跌 {breadth['down']} / 平盘 {breadth['flat']}")
     if up_sectors:
         lines.append("")
-        lines.append("🔥 领涨板块：")
+        lines.append("🔥 领涨板块：" if up_source == "东方财富" else f"🔥 领涨板块（{up_source}口径）：")
         for i, s in enumerate(up_sectors, 1):
             lines.append(f"{i}. {s['name']} {s['pct']:+.2f}%")
+    else:
+        lines.append("")
+        lines.append("🔥 领涨板块：数据源暂不可用")
     if down_sectors:
         lines.append("")
-        lines.append("🧊 领跌板块：")
+        lines.append("🧊 领跌板块：" if down_source == "东方财富" else f"🧊 领跌板块（{down_source}口径）：")
         for i, s in enumerate(down_sectors, 1):
             lines.append(f"{i}. {s['name']} {s['pct']:+.2f}%")
+    else:
+        lines.append("")
+        lines.append("🧊 领跌板块：数据源暂不可用")
     news_lines = _news_block(news)
     if news_lines:
         lines.append("━━━━━━━━━━━━━━")
@@ -395,6 +780,8 @@ def build_close(indices: list[dict], up_sectors: list[dict], down_sectors: list[
         pcts = [i["pct"] for i in indices]
         main_line = f"资金主线集中在「{up_sectors[0]['name']}」方向" if up_sectors else "板块轮动较快"
         lines.append(f"💡 简评：{_mood_line(pcts)}；{main_line}。")
+    if alert:
+        lines.append(alert)
     lines.append("⚠️ 数据仅供参考，不构成投资建议。")
     return "\n".join(lines)
 
@@ -404,7 +791,7 @@ def build_close(indices: list[dict], up_sectors: list[dict], down_sectors: list[
 # ---------------------------------------------------------------------------
 def feishu_send(text: str) -> bool:
     """读取 openclaw.json 中的应用凭据 → tenant_access_token → 发群消息。"""
-    with open(OPENCLAW_JSON, encoding="utf-8") as f:
+    with open(find_openclaw_json(), encoding="utf-8") as f:
         cfg = json.load(f)
     feishu_cfg = cfg.get("channels", {}).get("feishu", {})
     app_id = feishu_cfg.get("appId")
@@ -491,6 +878,12 @@ def main() -> int:
 
     # 待推送模式：只负责按时把分析版推出去
     if args.push_pending:
+        if args.dry_run:
+            log("dry-run 模式，不推送（--push-pending 仅拦截，不发送）")
+            return 0
+        if args.no_push:
+            log("--no-push 与 --push-pending 组合，已拦截，不推送")
+            return 0
         log(f"待推送任务开始 mode={args.push_pending}")
         return push_pending(args.push_pending)
 
@@ -498,28 +891,51 @@ def main() -> int:
         + ("（--no-llm）" if args.no_llm else ""))
     try:
         indices = fetch_indices()
-        up_sectors = fetch_sectors(po=1)
-        down_sectors = fetch_sectors(po=0) if args.mode == "close" else []
-        breadth = fetch_breadth() if args.mode == "close" else {"up": 0, "down": 0, "flat": 0}
-        news = fetch_news()
     except Exception as e:
-        log(f"ERROR 数据抓取失败: {e}")
+        log(f"ERROR 指数数据双源抓取均失败，简报中止: {e}")
         return 1
+
+    degradations: list[str] = []
+    up_sectors, up_source = fetch_sectors_with_source(po=1, degradations=degradations)
+    if args.mode == "close":
+        down_sectors, down_source = fetch_sectors_with_source(po=0, degradations=degradations)
+        breadth, breadth_source = fetch_breadth_with_source(degradations=degradations)
+    else:
+        down_sectors, down_source = [], "不可用"
+        breadth = {"up": 0, "down": 0, "flat": 0}
+        breadth_source = "不可用"
+    news = fetch_news(degradations=degradations)
+    log(f"数据源状态: 指数=腾讯/东财兜底 领涨板块={up_source} 领跌板块={down_source} 涨跌家数={breadth_source} 快讯={'东方财富' if news else '空'}")
+
+    consecutive = update_degradation_state(degradations)
+    degradation_alert = None
+    if degradations:
+        reasons = "；".join(dict.fromkeys(degradations))
+        if consecutive >= DEGRADE_ALERT_THRESHOLD:
+            log(f"ERROR 数据源已连续 {consecutive} 个交易日降级，今日降级: {reasons}")
+            degradation_alert = f"⚠️ 数据源已连续 {consecutive} 个交易日降级，请检查东财/腾讯接口稳定性"
+        else:
+            log(f"WARN 数据源发生降级（连续 {consecutive} 个交易日），今日降级: {reasons}")
 
     # 行情分析（失败降级纯模板，不影响推送）
     analysis = None
-    if not args.no_llm:
+    if not args.no_llm and not (args.mode == "close" and breadth_source == "不可用"):
         try:
-            analysis = llm_analyze(args.mode, indices, up_sectors, down_sectors, breadth, news)
+            analysis = llm_analyze(args.mode, indices, up_sectors, down_sectors, breadth, news,
+                                   up_source, down_source, breadth_source)
             log(f"行情分析生成成功（{len(analysis)} 字）")
         except Exception as e:
             log(f"WARN 行情分析生成失败，降级纯模板: {e}")
+    elif args.mode == "close" and breadth_source == "不可用":
+        log("WARN 涨跌家数数据不可用，跳过AI分析，使用纯模板")
 
     try:
         if args.mode == "morning":
-            briefing = build_morning(indices, up_sectors, news, analysis)
+            briefing = build_morning(indices, up_sectors, news, analysis, up_source,
+                                     degradation_alert)
         else:
-            briefing = build_close(indices, up_sectors, down_sectors, breadth, news, analysis)
+            briefing = build_close(indices, up_sectors, down_sectors, breadth, news, analysis,
+                                   up_source, down_source, breadth_source, degradation_alert)
     except Exception as e:
         log(f"ERROR 简报生成失败: {e}")
         return 1
@@ -528,7 +944,9 @@ def main() -> int:
 
     # 数据源输出（不推送也保存，供 bot 分析用）
     if args.save:
-        save_data_source(args.mode, indices, up_sectors, down_sectors, breadth, news, briefing)
+        save_data_source(args.mode, indices, up_sectors, down_sectors, breadth, news, briefing,
+                         {"up_sectors": up_source, "down_sectors": down_source,
+                          "breadth": breadth_source})
 
     # 去重：按模式分别记录指纹
     fingerprint = hashlib.sha256(briefing.encode("utf-8")).hexdigest()
