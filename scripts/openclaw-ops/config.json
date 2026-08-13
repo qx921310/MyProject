@@ -1,0 +1,17 @@
+{
+  "db_path": "/home/ubuntu/.openclaw/agents/main/agent/openclaw-agent.sqlite",
+  "data_dir": "/home/ubuntu/.openclaw",
+  "openclaw_bin": "openclaw",
+  "service": "openclaw-gateway.service",
+  "dispatch_error_pattern": "changed while starting work",
+  "journalctl_window_minutes": 5,
+  "dispatch_error_threshold": 3,
+  "idle_minutes": 30,
+  "cooldown_minutes": 60,
+  "cron_interval_minutes": 5,
+  "snapshot_log": "data/session-snapshots.log",
+  "state_file": "data/session-alert-state.json",
+  "http_timeout_seconds": 10,
+  "backup_keep_days": 7,
+  "verify_wait_seconds": 10
+}
