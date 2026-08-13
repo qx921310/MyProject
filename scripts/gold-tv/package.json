@@ -1,0 +1,15 @@
+{
+  "name": "gold-tv",
+  "version": "1.0.0",
+  "description": "Dual-source XAU spot check (Tencent + TradingView)",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --check dual_check.js && node --check fetch_tv_xau.js"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "@mathieuc/tradingview": "^3.5.2"
+  }
+}
