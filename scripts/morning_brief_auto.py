@@ -228,6 +228,11 @@ def main():
                         help="不输出文本简报（仅保存数据时用）")
     args = parser.parse_args()
 
+    if args.silent:
+        # silent 模式：stderr 重定向到 devnull，抓数任务零噪音（成功+失败路径全静默）
+        import os
+        sys.stderr = open(os.devnull, "w")
+
     # 抓数据（无论是否保存都要抓）
     ashare = gold = us = None
     try:
