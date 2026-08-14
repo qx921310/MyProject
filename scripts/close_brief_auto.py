@@ -172,35 +172,84 @@ def fetch_us():
     return out
 
 
+def save_data_json(prefix, ashare=None, gold=None, us=None):
+    """保存结构化数据到 ~/.hermes/data/，供 LLM 分析任务读取。"""
+    import json
+    import os
+
+    data_dir = os.path.expanduser("~/.hermes/data")
+    os.makedirs(data_dir, exist_ok=True)
+    path = os.path.join(data_dir, f"{prefix}_{datetime.now(BJ_TZ).strftime('%Y%m%d')}.json")
+
+    payload = {
+        "fetched_at": bj_now(),
+        "timezone": "Asia/Shanghai",
+        "ashare": ashare if ashare is not None else [],
+        "gold": gold if gold is not None else None,
+        "us": us if us is not None else [],
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return path
+
+
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="收盘简报脚本（纯 Python）")
+    parser.add_argument("--save", action="store_true",
+                        help="保存结构化数据到 ~/.hermes/data/（供 LLM 分析）")
+    parser.add_argument("--silent", action="store_true",
+                        help="不输出文本简报（仅保存数据时用）")
+    args = parser.parse_args()
+
+    # 抓数据（无论是否保存都要抓）
+    ashare = gold = us = None
+    try:
+        ashare = fetch_ashare()
+    except Exception as exc:
+        sys.stderr.write(f"[提示] A股获取失败: {exc}\n")
+    try:
+        gold = fetch_gold()
+    except Exception as exc:
+        sys.stderr.write(f"[提示] 黄金获取失败: {exc}\n")
+    us = fetch_us()
+
+    if args.save:
+        prefix = "close"
+        saved_path = save_data_json(prefix, ashare, gold, us)
+        if not args.silent:
+            print(f"数据已保存: {saved_path}", file=sys.stderr)
+
+    if args.silent:
+        return
+
     lines = []
     lines.append("📊 收盘简报")
     lines.append(f"🕗 时间: {bj_now()}（北京时间）")
     lines.append("")
 
     lines.append("📈 A股收盘")
-    try:
-        ashare = fetch_ashare()
+    if ashare:
         total_yi = 0.0
         for label, price, chg, turnover_yi in ashare:
             emoji = "📈" if chg >= 0 else "📉"
             lines.append(f"  {emoji} {label} {fmt_num(price)}（{fmt_chg(chg)}）")
             total_yi += turnover_yi
         lines.append(f"  💱 两市成交约 {total_yi:.0f} 亿")
-    except Exception as exc:
-        lines.append(f"  ⚠️ 获取失败: {exc}")
+    else:
+        lines.append("  ⚠️ 获取失败")
     lines.append("")
 
     lines.append("🥇 伦敦金（XAUUSD）")
-    try:
-        price, chg, high, low, rsi = fetch_gold()
+    if gold:
+        price, chg, high, low, rsi = gold
         lines.append(f"  💰 现价 {fmt_num(price)}（{fmt_chg(chg)}） 高 {fmt_num(high)} 低 {fmt_num(low)} RSI {fmt_num(rsi, 1)}")
-    except Exception as exc:
-        lines.append(f"  ⚠️ 获取失败: {exc}")
+    else:
+        lines.append("  ⚠️ 获取失败")
     lines.append("")
 
     lines.append("🇺🇸 美股隔夜收盘")
-    us = fetch_us()
     if us:
         for label, close, chg in us:
             emoji = "📈" if chg >= 0 else "📉"
