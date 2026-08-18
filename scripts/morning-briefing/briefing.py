@@ -404,7 +404,7 @@ def _parse_qq_compact_quotes(raw: str, label: str) -> list[dict]:
                 "name": fields[1], "price": price, "pct": pct, "time": fields[30],
             })
         else:
-            # 黄金：最新价=0，涨跌幅=1，时间=6，名称=最后一个
+            # 黄金：最新价=0，涨跌幅=1，日内高=4，日内低=5，时间=6，名称=最后一个
             if len(fields) < 7 or not fields[0] or not fields[1]:
                 continue
             name = next((f for f in reversed(fields) if f in GOLD_KNOWN_NAMES), "")
@@ -413,10 +413,13 @@ def _parse_qq_compact_quotes(raw: str, label: str) -> list[dict]:
             try:
                 price = float(fields[0])
                 pct = float(fields[1])
+                high = float(fields[4]) if fields[4] else None
+                low = float(fields[5]) if fields[5] else None
             except (TypeError, ValueError):
                 continue
             result.append({
                 "name": name, "price": price, "pct": pct, "time": fields[6],
+                "high": high, "low": low,
             })
     if not result:
         raise RuntimeError(f"腾讯{label}行情解析为空")
@@ -652,7 +655,7 @@ def llm_analyze(mode: str, indices: list[dict], up_sectors: list[dict],
                 gold: list[dict] | None = None,
                 up_source: str = "东方财富", down_source: str = "东方财富",
                 breadth_source: str = "东方财富") -> str:
-    """调用 DeepSeek 生成行情分析。早盘为五段结构，收盘保持原 prompt。"""
+    """调用 DeepSeek 生成行情分析。早盘与收盘均为五段结构。"""
     api_key, base_url, model_id = _load_deepseek_config()
     if not api_key:
         raise RuntimeError("未找到 DEEPSEEK_API_KEY")
@@ -730,24 +733,44 @@ def llm_analyze(mode: str, indices: list[dict], up_sectors: list[dict],
             f"{data_lines}"
         )
     else:
-        mode_label = "收盘"
+        idx_lines_close = "；".join(
+            f"{i['name']} {i['price']:.2f} ({i['pct']:+.2f}%) "
+            f"高{i['high']:.2f}/低{i['low']:.2f}" for i in indices
+        )
+        if gold:
+            gold_lines_close = "；".join(
+                f"{g['name']} {g['price']:.2f} ({g['pct']:+.2f}%)"
+                + (
+                    f" 日内高 {g['high']:.2f}/低 {g['low']:.2f}"
+                    if g.get("high") is not None and g.get("low") is not None else ""
+                )
+                + f" {g['time']}（北京时间）"
+                for g in gold
+            )
+            gold_block_close = f"【黄金实时】{gold_lines_close}"
+        else:
+            gold_block_close = "【黄金实时】数据不可用（勿引用）。"
         data_blocks = [
-            f"【指数】{idx_lines}",
+            f"【指数】{idx_lines_close}",
+            breadth_block,
             up_block,
             down_block,
+            gold_block_close,
+            f"【财经快讯】\n{news_lines}",
         ]
-        if breadth_block:
-            data_blocks.append(breadth_block)
-        data_blocks.append(f"【财经快讯】\n{news_lines}")
         data_lines = "\n".join(data_blocks)
-        system_content = "你是一位严谨、简洁的A股市场分析师。"
-        max_tokens = 400
+        system_content = "你是一位严谨的市场分析师。"
+        max_tokens = 800
         prompt = (
-            f"你是严谨的A股分析师。基于以下【真实数据】和【财经快讯】写{mode_label}行情分析，"
-            f"不超过150字，中文，只输出分析正文。要求：①先给一句话盘面强弱判断；"
-            f"②指出主线板块与逻辑；③挑1-2条关键消息面并说明对盘面的潜在影响；"
-            f"④不给买卖建议。严禁编造数据，只使用提供的信息；"
-            f"若某字段标注数据不可用，则不要引用该字段。\n\n"
+            "你是严谨的市场分析师。基于以下【真实数据】写A股收盘市场分析，中文，"
+            "只输出分析正文，严格按五段结构输出：\n"
+            "①A股收盘概况：三大指数收盘与涨跌家数，一句话强弱判断；\n"
+            "②科技板块重点：从领涨/领跌板块中识别科技方向（电子、通信、半导体、计算机、AI算力、消费电子等）并说明主线逻辑，无科技板块则说明当日风格；\n"
+            "③黄金实时：伦敦金/现货黄金现价、涨跌、日内高低（KOKO 中仓黄金，单独成段）；\n"
+            "④消息面：当日快讯要点；\n"
+            "⑤行情分析：结合消息面与技术面（指数当日高低点、振幅、板块强弱）分析后市，传导判断必须基于提供的数据或快讯中的明确信号，不得臆测。\n"
+            "严禁编造数据，只使用提供的信息；若某字段标注数据不可用，则不要引用该字段；"
+            "不给买卖建议。\n\n"
             f"{data_lines}"
         )
 
@@ -890,6 +913,7 @@ def save_data_source(mode: str, indices: list[dict], up_sectors: list[dict],
     }
     if mode == "morning":
         payload["us_stocks"] = us_stocks
+    if mode in ("morning", "close"):
         payload["gold"] = gold
     json_path = os.path.join(DATA_DIR, f"latest-{mode}.json")
     md_path = os.path.join(DATA_DIR, f"latest-{mode}.md")
@@ -902,6 +926,7 @@ def save_data_source(mode: str, indices: list[dict], up_sectors: list[dict],
 
 def build_close(indices: list[dict], up_sectors: list[dict], down_sectors: list[dict],
                 breadth: dict, news: list[dict], analysis: str | None,
+                gold: list[dict] | None = None,
                 up_source: str = "东方财富", down_source: str = "东方财富",
                 breadth_source: str = "东方财富",
                 alert: str | None = None) -> str:
@@ -914,6 +939,23 @@ def build_close(indices: list[dict], up_sectors: list[dict], down_sectors: list[
         lines.append(f"📈 涨跌家数：上涨 {breadth['up']} / 下跌 {breadth['down']} / 平盘 {breadth['flat']}")
     else:
         lines.append(f"📈 涨跌家数（{breadth_source}口径）：上涨 {breadth['up']} / 下跌 {breadth['down']} / 平盘 {breadth['flat']}")
+    lines.append("━━━━━━━━━━━━━━")
+    if gold:
+        lines.append("【黄金实时】")
+        for i, item in enumerate(gold, 1):
+            arrow = "🔺" if item["pct"] > 0 else ("🔻" if item["pct"] < 0 else "➖")
+            time_part = f"  {item['time']}（北京时间）" if item.get("time") else ""
+            high = item.get("high")
+            low = item.get("low")
+            range_part = ""
+            if high is not None and low is not None:
+                range_part = f"  日内高 {high:.2f}/低 {low:.2f}"
+            lines.append(
+                f"{i}. {item['name']} {item['price']:.2f}  "
+                f"{arrow}{item['pct']:+.2f}%{range_part}{time_part}"
+            )
+    else:
+        lines.append("【黄金实时】数据不可用")
     if up_sectors:
         lines.append("")
         lines.append("🔥 领涨板块：" if up_source == "东方财富" else f"🔥 领涨板块（{up_source}口径）：")
@@ -1062,7 +1104,7 @@ def main() -> int:
         gold = fetch_gold(degradations=degradations)
     else:
         us_stocks = None
-        gold = None
+        gold = fetch_gold(degradations=degradations)
     up_sectors, up_source = fetch_sectors_with_source(po=1, degradations=degradations)
     if args.mode == "close":
         down_sectors, down_source = fetch_sectors_with_source(po=0, degradations=degradations)
@@ -1077,7 +1119,8 @@ def main() -> int:
         gold_status = "可用" if gold else "不可用"
         log(f"数据源状态: 指数=腾讯/东财兜底 领涨板块={up_source} 领跌板块={down_source} 涨跌家数={breadth_source} 美股={us_status} 黄金={gold_status} 快讯={'东方财富' if news else '空'}")
     else:
-        log(f"数据源状态: 指数=腾讯/东财兜底 领涨板块={up_source} 领跌板块={down_source} 涨跌家数={breadth_source} 快讯={'东方财富' if news else '空'}")
+        gold_status = "可用" if gold else "不可用"
+        log(f"数据源状态: 指数=腾讯/东财兜底 领涨板块={up_source} 领跌板块={down_source} 涨跌家数={breadth_source} 黄金={gold_status} 快讯={'东方财富' if news else '空'}")
 
     consecutive = update_degradation_state(degradations)
     degradation_alert = None
@@ -1107,7 +1150,7 @@ def main() -> int:
                                      up_source, degradation_alert)
         else:
             briefing = build_close(indices, up_sectors, down_sectors, breadth, news, analysis,
-                                   up_source, down_source, breadth_source, degradation_alert)
+                                   gold, up_source, down_source, breadth_source, degradation_alert)
     except Exception as e:
         log(f"ERROR 简报生成失败: {e}")
         return 1
