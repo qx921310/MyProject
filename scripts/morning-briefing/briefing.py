@@ -36,6 +36,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import sys
 import tempfile
@@ -81,6 +82,21 @@ GOLD_KNOWN_NAMES = {
     "COMEX纽约金", "纽约黄金", "COMEX黄金",
     "伦敦金现货", "伦敦金（现货黄金）",
 }
+# Yahoo Finance 美股指数期货代码表（顺序即简报输出顺序）。
+US_FUTURES_YAHOO_SYMBOLS = {
+    "NQ=F": "纳斯达克100期货",
+    "ES=F": "标普500期货",
+    "YM=F": "道指期货",
+}
+US_FUTURES_YAHOO_CHART_URL = (
+    "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=5m&range=1d"
+)
+# 腾讯标普500指数期货兜底数据源。
+US_FUTURES_QQ_ES = "https://qt.gtimg.cn/q=hf_ES"
+# 腾讯 hf_ES 返回名称 → 简报白名单名称。
+US_FUTURES_QQ_NAME_MAP = {"标普500指数期货": "标普500期货"}
+# 美股期货名称白名单，只接受已知名称，避免误读日期/空字段。
+US_FUTURES_KNOWN_NAMES = {"纳斯达克100期货", "标普500期货", "道指期货"}
 INDEX_EM = (
     "https://push2.eastmoney.com/api/qt/ulist.np/get?"
     "fltt=2&invt=2&fields=f2,f3,f4,f12,f14,f15,f16,f17,f18"
@@ -458,6 +474,124 @@ def fetch_gold(degradations: list[str] | None = None) -> list[dict] | None:
     except Exception as e:
         _note_degradation(degradations, "黄金行情失败，字段降级为不可用")
         log(f"WARN 黄金行情抓取失败，字段降级为不可用: {e}")
+        return None
+
+
+def _fetch_yahoo_us_future(symbol: str, name: str) -> dict:
+    """抓取并自校验单条 Yahoo 美股指数期货。"""
+    raw = http_get(
+        US_FUTURES_YAHOO_CHART_URL.format(symbol=symbol), timeout=8, retries=0
+    ).decode("utf-8", errors="replace")
+    data = json.loads(raw)
+    results = ((data.get("chart") or {}).get("result")) or []
+    if not results:
+        raise RuntimeError("Yahoo chart.result 为空")
+    meta = results[0].get("meta") or {}
+    meta_symbol = str(meta.get("symbol") or "").strip().upper()
+    if meta_symbol != symbol.upper():
+        raise RuntimeError(f"Yahoo {symbol} 返回合约不匹配: {meta_symbol}")
+    try:
+        price = float(meta["regularMarketPrice"])
+        prev_close = float(meta.get("chartPreviousClose") or meta.get("previousClose"))
+        market_time = meta.get("regularMarketTime")
+    except (KeyError, TypeError, ValueError) as e:
+        raise RuntimeError(f"Yahoo {symbol} meta 解析异常: {e}")
+    if (
+        not math.isfinite(price)
+        or not math.isfinite(prev_close)
+        or price <= 0
+        or prev_close <= 0
+    ):
+        raise RuntimeError(f"Yahoo {symbol} 价格自校验失败: price={price}, prev_close={prev_close}")
+    pct = round((price - prev_close) / prev_close * 100, 2)
+    if abs(pct) > 15:
+        raise RuntimeError(f"Yahoo {symbol} 涨跌幅自校验失败: {pct}%")
+    if not market_time:
+        raise RuntimeError(f"Yahoo {symbol} 缺少 regularMarketTime")
+    try:
+        market_ts = float(market_time)
+    except (TypeError, ValueError) as e:
+        raise RuntimeError(f"Yahoo {symbol} regularMarketTime 解析异常: {e}")
+    if not (946684800 <= market_ts <= 1893456000):
+        raise RuntimeError(f"Yahoo {symbol} regularMarketTime 超出合理范围: {market_ts}")
+    try:
+        time_str = datetime.fromtimestamp(market_ts, TZ_UTC8).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+    except (TypeError, ValueError, OSError, OverflowError) as e:
+        raise RuntimeError(f"Yahoo {symbol} 时间解析异常: {e}")
+    if name not in US_FUTURES_KNOWN_NAMES:
+        raise RuntimeError(f"Yahoo {symbol} 名称不在白名单: {name}")
+    return {"name": name, "price": price, "pct": pct, "time": time_str}
+
+
+def _fetch_qq_us_future_es() -> dict:
+    """腾讯 hf_ES 兜底：标普500指数期货。"""
+    raw = http_get(US_FUTURES_QQ_ES).decode("gbk", errors="replace")
+    for line in raw.strip().split(";"):
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        payload = line.split("=", 1)[1].strip().strip('"')
+        if not payload:
+            continue
+        fields = [f.strip() for f in payload.split(",")]
+        if len(fields) < 8:
+            continue
+        name = US_FUTURES_QQ_NAME_MAP.get(fields[-1], "")
+        if name not in US_FUTURES_KNOWN_NAMES:
+            continue
+        try:
+            price = float(fields[0])
+            pct = float(fields[1])
+        except (TypeError, ValueError):
+            continue
+        time_raw = fields[6].strip()
+        if (
+            not math.isfinite(price)
+            or not math.isfinite(pct)
+            or price <= 0
+            or abs(pct) > 15
+            or not time_raw
+        ):
+            continue
+        today = datetime.now(TZ_UTC8).strftime("%Y-%m-%d")
+        clock = time_raw.split(" ")[-1]
+        clock_parts = clock.split(":")
+        if len(clock_parts) < 2:
+            continue
+        time_str = f"{today} {clock_parts[0].zfill(2)}:{clock_parts[1].zfill(2)}"
+        return {"name": name, "price": price, "pct": pct, "time": time_str}
+    raise RuntimeError("腾讯 hf_ES 行情解析为空")
+
+
+def fetch_us_futures(degradations: list[str] | None = None) -> list[dict] | None:
+    """美股指数期货：Yahoo 三条优先，成功 >=2 条即返回；否则回退腾讯 hf_ES。"""
+    yahoo_results = []
+    yahoo_errors = []
+    for symbol, name in US_FUTURES_YAHOO_SYMBOLS.items():
+        try:
+            yahoo_results.append(_fetch_yahoo_us_future(symbol, name))
+        except Exception as e:
+            yahoo_errors.append(f"{symbol}: {e}")
+    if len(yahoo_results) >= 2:
+        return yahoo_results
+
+    if yahoo_results:
+        log(f"WARN Yahoo 美股期货仅成功 {len(yahoo_results)} 条，回退腾讯 hf_ES")
+    else:
+        detail = "；".join(yahoo_errors) if yahoo_errors else "无返回"
+        log(f"WARN Yahoo 美股期货全部失败，回退腾讯 hf_ES: {detail}")
+
+    try:
+        item = _fetch_qq_us_future_es()
+        if item["name"] not in US_FUTURES_KNOWN_NAMES:
+            raise RuntimeError(f"腾讯 hf_ES 名称不在白名单: {item['name']}")
+        _note_degradation(degradations, "美股期货 Yahoo 主源失败，已降级腾讯")
+        return [item]
+    except Exception as e:
+        _note_degradation(degradations, "美股期货失败，字段降级为不可用")
+        log(f"WARN 美股期货抓取失败，字段降级为不可用: {e}")
         return None
 
 
@@ -897,7 +1031,8 @@ def save_data_source(mode: str, indices: list[dict], up_sectors: list[dict],
                      down_sectors: list[dict], breadth: dict, news: list[dict],
                      briefing: str, sources: dict | None = None,
                      us_stocks: list[dict] | None = None,
-                     gold: list[dict] | None = None) -> str:
+                     gold: list[dict] | None = None,
+                     us_futures: list[dict] | None = None) -> str:
     """把数据源基础版写入本地 logs/data/，返回主文件路径。"""
     os.makedirs(DATA_DIR, exist_ok=True)
     payload = {
@@ -911,10 +1046,11 @@ def save_data_source(mode: str, indices: list[dict], up_sectors: list[dict],
         "briefing": briefing,
         "sources": sources or {},
     }
-    if mode == "morning":
-        payload["us_stocks"] = us_stocks
     if mode in ("morning", "close"):
+        payload["us_stocks"] = us_stocks
         payload["gold"] = gold
+    if mode == "close":
+        payload["us_futures"] = us_futures
     json_path = os.path.join(DATA_DIR, f"latest-{mode}.json")
     md_path = os.path.join(DATA_DIR, f"latest-{mode}.md")
     with open(json_path, "w", encoding="utf-8") as f:
@@ -926,7 +1062,9 @@ def save_data_source(mode: str, indices: list[dict], up_sectors: list[dict],
 
 def build_close(indices: list[dict], up_sectors: list[dict], down_sectors: list[dict],
                 breadth: dict, news: list[dict], analysis: str | None,
+                us_stocks: list[dict] | None = None,
                 gold: list[dict] | None = None,
+                us_futures: list[dict] | None = None,
                 up_source: str = "东方财富", down_source: str = "东方财富",
                 breadth_source: str = "东方财富",
                 alert: str | None = None) -> str:
@@ -956,6 +1094,29 @@ def build_close(indices: list[dict], up_sectors: list[dict], down_sectors: list[
             )
     else:
         lines.append("【黄金实时】数据不可用")
+    if us_stocks:
+        us_parts = [
+            f"{item['name']} {item['price']:.2f} ({item['pct']:+.2f}%)"
+            for item in us_stocks
+        ]
+        lines.append("")
+        lines.append("美盘收盘：" + " | ".join(us_parts))
+    else:
+        lines.append("")
+        lines.append("美盘收盘：数据源暂不可用")
+    if us_futures:
+        parts = [
+            f"{item['name']} {item['price']:.2f} {item['pct']:+.2f}%"
+            for item in us_futures
+        ]
+        futures_time = str(us_futures[0].get("time") or "")
+        hhmm = futures_time.split(" ")[-1][-5:]
+        if len(hhmm) < 5 or ":" not in hhmm:
+            hhmm = ""
+        time_suffix = f"，{hhmm}" if hhmm else ""
+        lines.append(f"美股期货（交易中{time_suffix}）：" + " | ".join(parts))
+    else:
+        lines.append("美股期货：数据源暂不可用")
     if up_sectors:
         lines.append("")
         lines.append("🔥 领涨板块：" if up_source == "东方财富" else f"🔥 领涨板块（{up_source}口径）：")
@@ -1102,9 +1263,11 @@ def main() -> int:
     if args.mode == "morning":
         us_stocks = fetch_us_stocks(degradations=degradations)
         gold = fetch_gold(degradations=degradations)
+        us_futures = None
     else:
-        us_stocks = None
+        us_stocks = fetch_us_stocks(degradations=degradations)
         gold = fetch_gold(degradations=degradations)
+        us_futures = fetch_us_futures(degradations=degradations)
     up_sectors, up_source = fetch_sectors_with_source(po=1, degradations=degradations)
     if args.mode == "close":
         down_sectors, down_source = fetch_sectors_with_source(po=0, degradations=degradations)
@@ -1119,8 +1282,10 @@ def main() -> int:
         gold_status = "可用" if gold else "不可用"
         log(f"数据源状态: 指数=腾讯/东财兜底 领涨板块={up_source} 领跌板块={down_source} 涨跌家数={breadth_source} 美股={us_status} 黄金={gold_status} 快讯={'东方财富' if news else '空'}")
     else:
+        us_status = "可用" if us_stocks else "不可用"
         gold_status = "可用" if gold else "不可用"
-        log(f"数据源状态: 指数=腾讯/东财兜底 领涨板块={up_source} 领跌板块={down_source} 涨跌家数={breadth_source} 黄金={gold_status} 快讯={'东方财富' if news else '空'}")
+        futures_status = "可用" if us_futures else "不可用"
+        log(f"数据源状态: 指数=腾讯/东财兜底 领涨板块={up_source} 领跌板块={down_source} 涨跌家数={breadth_source} 美股={us_status} 美股期货={futures_status} 黄金={gold_status} 快讯={'东方财富' if news else '空'}")
 
     consecutive = update_degradation_state(degradations)
     degradation_alert = None
@@ -1150,7 +1315,8 @@ def main() -> int:
                                      up_source, degradation_alert)
         else:
             briefing = build_close(indices, up_sectors, down_sectors, breadth, news, analysis,
-                                   gold, up_source, down_source, breadth_source, degradation_alert)
+                                   us_stocks, gold, us_futures, up_source, down_source,
+                                   breadth_source, degradation_alert)
     except Exception as e:
         log(f"ERROR 简报生成失败: {e}")
         return 1
@@ -1162,7 +1328,7 @@ def main() -> int:
         save_data_source(args.mode, indices, up_sectors, down_sectors, breadth, news, briefing,
                          {"up_sectors": up_source, "down_sectors": down_source,
                           "breadth": breadth_source},
-                         us_stocks, gold)
+                         us_stocks, gold, us_futures)
 
     # 去重：按模式分别记录指纹
     fingerprint = hashlib.sha256(briefing.encode("utf-8")).hexdigest()
